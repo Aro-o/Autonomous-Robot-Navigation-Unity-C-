@@ -2,7 +2,8 @@
 
 A Unity-based autonomous robot navigation system that uses raycast sensors and physics-based wheel control to navigate dynamically changing obstacle courses without any hard-coded paths. Developed as part of the **MSc Artificial Intelligence & Robotics** programme at the **University of Hertfordshire**.
 
-![Robot Navigation Demo](24105689.mp4)
+[![Robot Navigation Demo]
+(https://drive.google.com/file/d/1gIYTyXzloWKPyDaWyPPOlZINx66VMDnF/view?usp=drivesdk)
 
 ---
 
