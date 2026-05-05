@@ -1,0 +1,301 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using System.Threading.Tasks;
+
+public class RobotController : MonoBehaviour
+{
+    [SerializeField] private WheelCollider WheelColliderFrontLeft;
+    [SerializeField] private WheelCollider WheelColliderFrontRight;
+    [SerializeField] private WheelCollider WheelColliderBackLeft;
+    [SerializeField] private WheelCollider WheelColliderBackRight;
+
+    [SerializeField] private Transform TransformWheelFrontLeft;
+    [SerializeField] private Transform TransformWheelFrontRight;
+    [SerializeField] private Transform TransformWheelBackLeft;
+    [SerializeField] private Transform TransformWheelBackRight;
+
+    [SerializeField] private Transform RaycastSensorFront;
+    [SerializeField] private Transform RaycastSensorLeft;
+    [SerializeField] private Transform RaycastSensorRight;
+    [SerializeField] private Transform EulerAnglesSensor;
+
+    [SerializeField] private float maxSteeringAngle = 30f;
+    [SerializeField] private float driveTorque = 70f;
+    [SerializeField] private float breakForce;
+
+    private float velocityScale = 1.42f;
+    private float turnResponsiveness = 1.25f;
+    private Rigidbody physicsBody;
+    private float currentSpeed;
+    private float wheelAngle;
+    private bool shouldBrake;
+
+    private float firstSensorRange = 5f;
+    private float secondSensorRange = 6f;
+    private float thirdSensorRange = 6f;
+
+    private static readonly Vector3 FrontRayOffset = new Vector3(20f, 0f, 0f);
+    private static readonly Vector3 LeftOffset1 = new Vector3(0f, -10f, 0f);
+    private static readonly Vector3 LeftOffset2 = new Vector3(8f, -30f, 0f);
+    private static readonly Vector3 LeftOffset3 = new Vector3(16f, -60f, 0f);
+    private static readonly Vector3 RightOffset1 = new Vector3(0f, 10f, 0f);
+    private static readonly Vector3 RightOffset2 = new Vector3(8f, 30f, 0f);
+    private static readonly Vector3 RightOffset3 = new Vector3(16f, 60f, 0f);
+
+    private const string ROAD_LAYER = "Road";
+    private const string OBS_LAYER = "Obs";
+    private const string TRACK_ROOT_NAME = "Track";
+    private const string OBSTACLES_ROOT_NAME = "Obstacles";
+
+    private WheelFrictionCurve originalFLForward, originalFLSide, originalFRForward, originalFRSide;
+    private WheelFrictionCurve originalBLForward, originalBLSide, originalBRForward, originalBRSide;
+
+    private void Start()
+    {
+        physicsBody = GetComponent<Rigidbody>();
+
+        if (physicsBody == null ||
+            WheelColliderFrontLeft == null || WheelColliderFrontRight == null ||
+            WheelColliderBackLeft == null || WheelColliderBackRight == null ||
+            TransformWheelFrontLeft == null || TransformWheelFrontRight == null ||
+            TransformWheelBackLeft == null || TransformWheelBackRight == null ||
+            RaycastSensorFront == null || RaycastSensorLeft == null || RaycastSensorRight == null ||
+            EulerAnglesSensor == null)
+        {
+            Debug.LogError("RobotController: Assign all WheelColliders, wheel Transforms, and the 4 sensors in the Inspector.");
+            enabled = false;
+            return;
+        }
+
+        ConfigureSceneLayers();
+        StoreFrictionDefaults();
+    }
+
+    private void FixedUpdate()
+    {
+        ProcessRoadTracking();
+        ProcessObstacleDetection();
+        ProcessSlopeAdjustments();
+        ModifyVelocityParameters();
+        ExecuteMotorControl();
+        RefreshWheelPositions();
+
+        currentSpeed = physicsBody.linearVelocity.magnitude;
+    }
+
+    private void ProcessRoadTracking()
+    {
+        bool detectedLeftRoad = CastDetectionRay(RaycastSensorLeft, LeftOffset3, thirdSensorRange * turnResponsiveness, ROAD_LAYER);
+        bool detectedRightRoad = CastDetectionRay(RaycastSensorRight, RightOffset3, thirdSensorRange * turnResponsiveness, ROAD_LAYER);
+
+        if (!detectedLeftRoad || !detectedRightRoad)
+        {
+            if (!detectedLeftRoad) ApplySteeringInput(1f);
+            if (!detectedRightRoad) ApplySteeringInput(-1f);
+        }
+        else
+        {
+            ApplySteeringInput(0f);
+        }
+    }
+
+    private void ProcessObstacleDetection()
+    {
+        if (CastDetectionRay(RaycastSensorLeft, LeftOffset1, firstSensorRange * turnResponsiveness, OBS_LAYER)) ApplySteeringInput(1f);
+        if (CastDetectionRay(RaycastSensorRight, RightOffset1, firstSensorRange * turnResponsiveness, OBS_LAYER)) ApplySteeringInput(-1f);
+
+        if (CastDetectionRay(RaycastSensorLeft, LeftOffset2, secondSensorRange * turnResponsiveness, OBS_LAYER)) ApplySteeringInput(1f);
+        if (CastDetectionRay(RaycastSensorRight, RightOffset2, secondSensorRange * turnResponsiveness, OBS_LAYER)) ApplySteeringInput(-1f);
+
+        CastDetectionRay(RaycastSensorFront, FrontRayOffset, 20f * turnResponsiveness, ROAD_LAYER);
+    }
+
+    private void ProcessSlopeAdjustments()
+    {
+        float pitchAngle = ConvertToSignedAngle(EulerAnglesSensor.eulerAngles.x);
+        float rollAngle = ConvertToSignedAngle(EulerAnglesSensor.eulerAngles.z);
+
+        if (pitchAngle > 6f)
+        {
+            float torqueIncrease = 15f * pitchAngle;
+            driveTorque = Mathf.Max(driveTorque, 200f + torqueIncrease);
+            UpdateFrictionStrength(1.8f);
+        }
+        else if (pitchAngle < -6f)
+        {
+            driveTorque = Mathf.Max(0f, driveTorque - 120f);
+
+            if (currentSpeed > 8f * velocityScale) shouldBrake = true;
+
+            UpdateFrictionStrength(1.2f);
+        }
+        else
+        {
+            ResetToDefaultFriction();
+        }
+
+        if (Mathf.Abs(rollAngle) > 12f && currentSpeed > 6f * velocityScale)
+        {
+            shouldBrake = true;
+        }
+    }
+
+    private void ModifyVelocityParameters()
+    {
+        float slowThreshold = 2f * velocityScale;
+        float mediumThreshold = 4.3f * velocityScale;
+        float fastThreshold = 6f * velocityScale;
+        float veryFastThreshold = 12f * velocityScale;
+
+        bool isMovingSlowly = currentSpeed < slowThreshold;
+        bool isBelowMediumSpeed = currentSpeed > mediumThreshold;
+        bool isBelowFastSpeed = currentSpeed > fastThreshold;
+        bool isAboveVeryFast = currentSpeed > veryFastThreshold;
+
+        if (isMovingSlowly && driveTorque <= 50f)
+        {
+            driveTorque += 488f;
+            return;
+        }
+
+        if (driveTorque > 0f)
+        {
+            if (isBelowMediumSpeed) driveTorque -= 90f;
+            else if (isBelowFastSpeed) driveTorque -= 80f;
+        }
+        else if (driveTorque < 0f && isAboveVeryFast)
+        {
+            driveTorque -= 80f;
+        }
+    }
+
+    private void ExecuteMotorControl()
+    {
+        float CurrentAcceleration = shouldBrake ? 0f : driveTorque;
+        float adjustedTorque = driveTorque * velocityScale;
+
+        WheelColliderFrontLeft.motorTorque = adjustedTorque;
+        WheelColliderFrontRight.motorTorque = adjustedTorque;
+        WheelColliderBackLeft.motorTorque = adjustedTorque;
+        WheelColliderBackRight.motorTorque = adjustedTorque;
+
+        breakForce = shouldBrake ? 3000f : 0f;
+
+        WheelColliderFrontLeft.brakeTorque = breakForce;
+        WheelColliderFrontRight.brakeTorque = breakForce;
+        WheelColliderBackLeft.brakeTorque = breakForce;
+        WheelColliderBackRight.brakeTorque = breakForce;
+
+        shouldBrake = false;
+    }
+
+    private void ApplySteeringInput(float inputDirection)
+    {
+        wheelAngle = maxSteeringAngle * turnResponsiveness * inputDirection;
+        WheelColliderFrontLeft.steerAngle = wheelAngle;
+        WheelColliderFrontRight.steerAngle = wheelAngle;
+    }
+
+    private void RefreshWheelPositions()
+    {
+        SyncWheelTransform(WheelColliderFrontLeft, TransformWheelFrontLeft);
+        SyncWheelTransform(WheelColliderFrontRight, TransformWheelFrontRight);
+        SyncWheelTransform(WheelColliderBackLeft, TransformWheelBackLeft);
+        SyncWheelTransform(WheelColliderBackRight, TransformWheelBackRight);
+    }
+
+    private void SyncWheelTransform(WheelCollider collider, Transform visual)
+    {
+        collider.GetWorldPose(out Vector3 pos, out Quaternion rot);
+        visual.position = pos;
+        visual.rotation = rot;
+    }
+
+    private bool CastDetectionRay(Transform origin, Vector3 angleOffset, float distance, string targetLayer)
+    {
+        LayerMask detectionMask = LayerMask.GetMask(targetLayer);
+
+        Quaternion rotation = origin.rotation * Quaternion.Euler(angleOffset);
+        Vector3 direction = rotation * Vector3.forward;
+
+        bool rayHit = Physics.Raycast(origin.position, direction, distance, detectionMask);
+        Debug.DrawRay(origin.position, direction * distance, rayHit ? Color.red : Color.white);
+        return rayHit;
+    }
+
+    private static float ConvertToSignedAngle(float angle)
+    {
+        while (angle > 180f) angle -= 360f;
+        while (angle < -180f) angle += 360f;
+        return angle;
+    }
+
+    private void ConfigureSceneLayers()
+    {
+        int roadLayerIndex = LayerMask.NameToLayer(ROAD_LAYER);
+        int obstacleLayerIndex = LayerMask.NameToLayer(OBS_LAYER);
+        if (roadLayerIndex == -1 || obstacleLayerIndex == -1) return;
+
+        GameObject trackObject = GameObject.Find(TRACK_ROOT_NAME);
+        if (trackObject != null) AssignLayerToHierarchy(trackObject.transform, roadLayerIndex);
+
+        GameObject obstaclesObject = GameObject.Find(OBSTACLES_ROOT_NAME);
+        if (obstaclesObject != null) AssignLayerToHierarchy(obstaclesObject.transform, obstacleLayerIndex);
+    }
+
+    private void AssignLayerToHierarchy(Transform parent, int layerIndex)
+    {
+        parent.gameObject.layer = layerIndex;
+        for (int i = 0; i < parent.childCount; i++)
+            AssignLayerToHierarchy(parent.GetChild(i), layerIndex);
+    }
+
+    private void StoreFrictionDefaults()
+    {
+        originalFLForward = WheelColliderFrontLeft.forwardFriction;
+        originalFLSide = WheelColliderFrontLeft.sidewaysFriction;
+
+        originalFRForward = WheelColliderFrontRight.forwardFriction;
+        originalFRSide = WheelColliderFrontRight.sidewaysFriction;
+
+        originalBLForward = WheelColliderBackLeft.forwardFriction;
+        originalBLSide = WheelColliderBackLeft.sidewaysFriction;
+
+        originalBRForward = WheelColliderBackRight.forwardFriction;
+        originalBRSide = WheelColliderBackRight.sidewaysFriction;
+    }
+
+    private void ResetToDefaultFriction()
+    {
+        WheelColliderFrontLeft.forwardFriction = originalFLForward;
+        WheelColliderFrontLeft.sidewaysFriction = originalFLSide;
+
+        WheelColliderFrontRight.forwardFriction = originalFRForward;
+        WheelColliderFrontRight.sidewaysFriction = originalFRSide;
+
+        WheelColliderBackLeft.forwardFriction = originalBLForward;
+        WheelColliderBackLeft.sidewaysFriction = originalBLSide;
+
+        WheelColliderBackRight.forwardFriction = originalBRForward;
+        WheelColliderBackRight.sidewaysFriction = originalBRSide;
+    }
+
+    private void UpdateFrictionStrength(float strength)
+    {
+        WheelFrictionCurve fwd, side;
+
+        fwd = WheelColliderFrontLeft.forwardFriction; fwd.stiffness = strength; WheelColliderFrontLeft.forwardFriction = fwd;
+        side = WheelColliderFrontLeft.sidewaysFriction; side.stiffness = strength; WheelColliderFrontLeft.sidewaysFriction = side;
+
+        fwd = WheelColliderFrontRight.forwardFriction; fwd.stiffness = strength; WheelColliderFrontRight.forwardFriction = fwd;
+        side = WheelColliderFrontRight.sidewaysFriction; side.stiffness = strength; WheelColliderFrontRight.sidewaysFriction = side;
+
+        fwd = WheelColliderBackLeft.forwardFriction; fwd.stiffness = strength; WheelColliderBackLeft.forwardFriction = fwd;
+        side = WheelColliderBackLeft.sidewaysFriction; side.stiffness = strength; WheelColliderBackLeft.sidewaysFriction = side;
+
+        fwd = WheelColliderBackRight.forwardFriction; fwd.stiffness = strength; WheelColliderBackRight.forwardFriction = fwd;
+        side = WheelColliderBackRight.sidewaysFriction; side.stiffness = strength; WheelColliderBackRight.sidewaysFriction = side;
+    }
+}
